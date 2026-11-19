@@ -8,6 +8,7 @@
 #include "nat.hpp"
 #include "network.hpp"
 #include "network_password.hpp"
+#include "party.hpp"
 #include "scheduler.hpp"
 #include "workshop/workshop.hpp"
 
@@ -46,10 +47,57 @@ template <typename T> int get_client_count(T *client_states) {
 
 bool is_host() { return game::server_running(); }
 
+// Max client count the running match actually uses, captured on the match's
+// first server frame. Joining clients mirror it (see party.cpp); the dvars
+// alone are unreliable while loading (com_maxclients still holds the lobby
+// default and sv_maxclients whatever the config says).
+std::atomic_int32_t match_max_clients{0};
+
+void capture_match_max_clients() {
+  // Only real matches: the frontend also runs a local server, and while the
+  // game starts up or reloads the frontend (mode switch, mod load) the UI
+  // level isn't running either. Locking the max clients then broke loading.
+  const std::string_view mapname = game::get_mapname().value_or("");
+  const bool in_match = game::server_running() &&
+                        !game::com::Com_IsRunningUILevel() &&
+                        !mapname.empty() && mapname != "core_frontend";
+  if (!in_match) {
+    if (match_max_clients.exchange(0) != 0 && !game::is_server()) {
+      party::set_host_match_max_clients(0);
+    }
+    return;
+  }
+
+  if (match_max_clients.load() == 0) {
+    match_max_clients = game::get_dvar_int("com_maxclients").value_or(0);
+    if (!game::is_server()) {
+      // Keep it for the whole match, restarts included
+      party::set_host_match_max_clients(match_max_clients.load());
+    }
+  }
+}
+
+int32_t get_host_max_clients() {
+  if (const int32_t captured = match_max_clients.load(); captured > 0) {
+    return captured;
+  }
+
+  // Match not started yet: best guess from the dvars
+  int32_t result = 0;
+  for (const char *dvar : {"com_maxclients", "sv_maxclients"}) {
+    const int32_t value = game::get_dvar_int(dvar).value_or(0);
+    if (value > 0 && (result == 0 || value < result)) {
+      result = value;
+    }
+  }
+  return result;
+}
+
 struct component final : generic_component {
   DEFINE_COMPONENT_NAME("getinfo");
 
   void post_unpack() override {
+    scheduler::loop(capture_match_max_clients, scheduler::pipeline::server);
 
     game::sv_wwwDownload = game::register_dvar_bool("sv_wwwDownload", false,
                                                     game::dvarFlags_e::NONE,
@@ -119,6 +167,15 @@ struct component final : generic_component {
       info.set("sv_running", game::server_running() ? "1" : "0");
       info.set("xpscale", std::format("{}", game::xp_scale()));
       info.set("gunxpscale", std::format("{}", game::gun_xp_scale()));
+      // The menu also runs a local server, so sv_running alone doesn't mean
+      // there is a match to join
+      info.set("in_match",
+               game::server_running() && !game::com::Com_IsRunningUILevel()
+                   ? "1"
+                   : "0");
+      // Joining clients mirror this so their client scripts register the
+      // same per-player clientfields as the host (see party.cpp)
+      info.set("host_maxclients", std::to_string(get_host_max_clients()));
       info.set("dedicated", game::is_server() ? "1" : "0");
       info.set("lobby", nat::joinable_lobby());
       info.set("hc",

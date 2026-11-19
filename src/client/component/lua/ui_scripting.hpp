@@ -21,6 +21,10 @@ bool show_unsafe_lua_dialog();
 void start_hot_reload(const std::string &path);
 void check_hot_reload();
 
+// Runs Lua code in the UI's Lua VM (main thread only). False if there is no
+// VM or the code failed; errors are printed to the console.
+bool run_lua(const std::string &code, const char *chunk_name);
+
 template <class... Args, std::size_t... I>
 auto wrap_function(const std::function<void(Args...)> &f,
                    std::index_sequence<I...>) {

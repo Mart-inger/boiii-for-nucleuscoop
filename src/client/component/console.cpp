@@ -36,7 +36,9 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <ctime>
 #include <filesystem>
+#include <fstream>
 #include <sstream>
 #include <unordered_set>
 #include <vector>
@@ -987,6 +989,62 @@ bool is_hidden_developer_message(const std::string_view message) {
          game::get_dvar_int("developer").value_or(0) < 1;
 }
 
+// Everything printed to the console is mirrored to boiii_players/console.log.
+// The previous session's log is kept as console_prev.log.
+std::ofstream console_log_file;
+// queue_message runs on every thread that prints
+std::mutex console_log_mutex;
+
+void open_console_log() {
+  std::scoped_lock lock(console_log_mutex);
+  const std::filesystem::path dir = "boiii_players";
+  const std::filesystem::path path = dir / "console.log";
+
+  std::error_code ec;
+  std::filesystem::create_directories(dir, ec);
+  if (std::filesystem::exists(path, ec)) {
+    std::filesystem::rename(path, dir / "console_prev.log", ec);
+  }
+
+  console_log_file.open(path, std::ios::out | std::ios::trunc);
+  if (!console_log_file.is_open()) {
+    return;
+  }
+
+  const std::time_t now = std::time(nullptr);
+  std::tm local{};
+  localtime_s(&local, &now);
+  char time_buf[64]{};
+  std::strftime(time_buf, sizeof(time_buf), "%Y-%m-%d %H:%M:%S", &local);
+
+  console_log_file << "BOIII V" SHORTVERSION " console log - " << time_buf
+                   << "\n\n";
+  console_log_file.flush();
+}
+
+void write_console_log(const std::string &text) {
+  std::scoped_lock lock(console_log_mutex);
+  if (!console_log_file.is_open()) {
+    return;
+  }
+
+  // Strip ^N color codes so the file stays readable
+  std::string clean;
+  clean.reserve(text.size());
+  for (size_t i = 0; i < text.size(); ++i) {
+    if (text[i] == '^' && i + 1 < text.size() &&
+        ((text[i + 1] >= '0' && text[i + 1] <= '9') || text[i + 1] == ':' ||
+         text[i + 1] == ';')) {
+      ++i;
+      continue;
+    }
+    clean.push_back(text[i]);
+  }
+
+  console_log_file << clean;
+  console_log_file.flush();
+}
+
 void queue_message(const char *message) {
   if (!message || !message[0] || is_hidden_developer_message(message)) {
     return;
@@ -1001,6 +1059,8 @@ void queue_message(const char *message) {
           }
         });
   }
+
+  write_console_log(message);
 
   {
     std::scoped_lock lock(pending_output_mutex);
@@ -1366,9 +1426,8 @@ void sys_create_console_stub(const HINSTANCE h_instance) {
   char text[CONSOLE_BUFFER_SIZE]{0};
 
   const char *class_name = "BOIII WinConsole";
-  const char *window_name = game::is_server()
-                                ? "BOIII V" SHORTVERSION " - Server"
-                                : "BOIII V" SHORTVERSION " - Console";
+  const char *window_name =
+      game::is_server() ? "BOIII V" SHORTVERSION " - Server" : "BOIII Console";
 
   WNDCLASSA wnd_class{};
   wnd_class.style = 0;
@@ -1622,7 +1681,7 @@ struct component final : generic_component {
   DEFINE_COMPONENT_NAME("console");
 
   component() {
-    SetConsoleTitleA("EZZ BOIII V" SHORTVERSION);
+    SetConsoleTitleA("BOIII Console");
 
     if (game::is_headless()) {
       if (!AttachConsole(ATTACH_PARENT_PROCESS)) {
@@ -1630,7 +1689,7 @@ struct component final : generic_component {
         AttachConsole(GetCurrentProcessId());
       }
 
-      SetConsoleTitleA("EZZ BOIII V" SHORTVERSION);
+      SetConsoleTitleA("BOIII Console");
       ShowWindow(GetConsoleWindow(),
                  hide_external_console() ? SW_HIDE : SW_SHOW);
 
@@ -1678,6 +1737,7 @@ struct component final : generic_component {
                      2); // Print from every thread
 
     terminate_runner = false;
+    open_console_log();
     load_dvar_list();
 
     this->message_runner_ =

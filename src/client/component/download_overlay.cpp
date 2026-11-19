@@ -14,6 +14,8 @@
 #include <imgui_impl_dx11.h>
 #include <imgui_impl_win32.h>
 
+#include <Xinput.h>
+
 // Declared in imgui_impl_win32.cpp but guarded by #if 0 in the header
 extern LRESULT ImGui_ImplWin32_WndProcHandler(HWND hWnd, UINT msg,
                                               WPARAM wParam, LPARAM lParam);
@@ -152,10 +154,68 @@ void apply_cod_theme() {
   c[ImGuiCol_TextSelectedBg] = ImVec4(0.91f, 0.46f, 0.07f, 0.35f);
 }
 
+// The overlay only gets mouse/keyboard through the game window's messages,
+// which Nucleus Co-op instances often don't receive, and ImGui is built
+// without gamepad support. Read the controller directly instead, through the
+// XInput the game itself loaded (Nucleus maps it to this player's pad):
+// A = Yes, B = No. Only new presses count, so a button already held when the
+// popup appears doesn't answer it.
+struct pad_answer {
+  bool yes{false};
+  bool no{false};
+};
+
+pad_answer read_pad_answer(const bool reset) {
+  using xinput_get_state_t = DWORD(WINAPI *)(DWORD, XINPUT_STATE *);
+  static const xinput_get_state_t get_state = []() -> xinput_get_state_t {
+    for (const char *dll :
+         {"xinput1_3.dll", "xinput1_4.dll", "xinput9_1_0.dll"}) {
+      HMODULE module = GetModuleHandleA(dll);
+      if (!module) {
+        module = LoadLibraryA(dll);
+      }
+      if (module) {
+        if (const FARPROC proc = GetProcAddress(module, "XInputGetState")) {
+          return reinterpret_cast<xinput_get_state_t>(proc);
+        }
+      }
+    }
+    return nullptr;
+  }();
+
+  static WORD previous_buttons = 0xFFFF; // ignore what is held at first
+  if (reset) {
+    previous_buttons = 0xFFFF;
+    return {};
+  }
+
+  pad_answer answer{};
+  if (!get_state) {
+    return answer;
+  }
+
+  XINPUT_STATE state{};
+  const WORD buttons =
+      get_state(0, &state) == ERROR_SUCCESS ? state.Gamepad.wButtons : 0;
+  const WORD pressed = buttons & ~previous_buttons;
+  previous_buttons = buttons;
+
+  answer.yes = (pressed & XINPUT_GAMEPAD_A) != 0;
+  answer.no = (pressed & XINPUT_GAMEPAD_B) != 0;
+  return answer;
+}
+
 void render_confirmation() {
   const auto cstate = confirm_.copy();
-  if (!cstate.active)
+  if (!cstate.active) {
+    read_pad_answer(true);
     return;
+  }
+
+  const pad_answer pad = read_pad_answer(false);
+  const bool key_yes = ImGui::IsKeyPressed(ImGuiKey_Enter, false) ||
+                       ImGui::IsKeyPressed(ImGuiKey_KeypadEnter, false);
+  const bool key_no = ImGui::IsKeyPressed(ImGuiKey_Escape, false);
 
   const auto &io = ImGui::GetIO();
   if (io.DisplaySize.x <= 0.f || io.DisplaySize.y <= 0.f)
@@ -194,7 +254,8 @@ void render_confirmation() {
                         ImVec4(0.95f, 0.52f, 0.10f, 1.f));
   ImGui::PushStyleColor(ImGuiCol_ButtonActive,
                         ImVec4(0.70f, 0.35f, 0.04f, 1.f));
-  if (ImGui::Button("Yes", ImVec2(button_width, btn_h))) {
+  if (ImGui::Button("Yes (A / Enter)", ImVec2(button_width, btn_h)) ||
+      pad.yes || key_yes) {
     const auto cb = cstate.on_yes;
     confirm_.access([](confirm_state &s) { s = {}; });
     if (cb)
@@ -210,7 +271,8 @@ void render_confirmation() {
                         ImVec4(0.32f, 0.32f, 0.34f, 1.f));
   ImGui::PushStyleColor(ImGuiCol_ButtonActive,
                         ImVec4(0.16f, 0.16f, 0.18f, 1.f));
-  if (ImGui::Button("No", ImVec2(button_width, btn_h))) {
+  if (ImGui::Button("No (B / Esc)", ImVec2(button_width, btn_h)) || pad.no ||
+      key_no) {
     const auto no_cb = cstate.on_no;
     confirm_.access([](confirm_state &s) { s = {}; });
     if (no_cb)

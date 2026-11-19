@@ -39,9 +39,56 @@ const std::filesystem::path &boiii_players_directory() {
   return path;
 }
 
+const std::filesystem::path &real_game_directory() {
+  static const std::filesystem::path path = [] {
+    // Nucleus Co-op runs each instance from its own folder whose game files
+    // are symlinks to the real installation; follow one back so paths
+    // relative to the installation (like the Steam workshop folder) work
+    std::error_code ec;
+    for (const std::filesystem::directory_entry &entry :
+         std::filesystem::directory_iterator(cwd(), ec)) {
+      if (!entry.is_symlink(ec) || entry.is_directory(ec)) {
+        continue;
+      }
+
+      std::filesystem::path target =
+          std::filesystem::read_symlink(entry.path(), ec);
+      if (ec || target.empty()) {
+        continue;
+      }
+      if (target.is_relative()) {
+        target = entry.path().parent_path() / target;
+      }
+
+      const std::filesystem::path folder =
+          std::filesystem::weakly_canonical(target.parent_path(), ec);
+      if (!ec && !folder.empty() && folder != cwd()) {
+        return folder;
+      }
+    }
+
+    return cwd();
+  }();
+  return path;
+}
+
 const std::filesystem::path &steam_workshop_content_directory() {
   static const std::filesystem::path path = std::filesystem::weakly_canonical(
       cwd() / "../../workshop/content" / game::APP_ID_STR);
+  return path;
+}
+
+const std::filesystem::path &installed_workshop_content_directory() {
+  static const std::filesystem::path path = [] {
+    std::error_code ec;
+    if (std::filesystem::exists(steam_workshop_content_directory(), ec)) {
+      return steam_workshop_content_directory();
+    }
+
+    return std::filesystem::weakly_canonical(
+        real_game_directory() / "../../workshop/content" / game::APP_ID_STR,
+        ec);
+  }();
   return path;
 }
 

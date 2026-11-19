@@ -7,6 +7,8 @@
 #include "command.hpp"
 #include "friends.hpp"
 #include "game/impl/ugc/ugc.hpp"
+#include "local_instances.hpp"
+#include "lua/ui_scripting.hpp"
 #include "nat.hpp"
 #include "network.hpp"
 #include "network_password.hpp"
@@ -29,6 +31,15 @@
 #include <frozen/string.h>
 #include <frozen/unordered_map.h>
 
+// In case of clangd compilation
+#if __has_include("version.hpp")
+#include "version.hpp"
+#else
+#ifndef SHORTVERSION
+#define SHORTVERSION "0"
+#endif
+#endif
+
 namespace party {
 game::EngineDependentDvarMut cl_connected_to_dedi;
 namespace {
@@ -36,6 +47,201 @@ constexpr uint16_t DEFAULT_SERVER_PORT = 27017;
 
 std::atomic_bool is_connecting_to_dedi{false};
 game::net::netadr_t connect_host{{}, {}, game::net::netadrtype_t::BAD, {}};
+
+// Every connect gets a new id. Work still pending for an older connect (its
+// server query, waiting for the host, waiting for a mode switch) stops once
+// it sees a newer id, so repeated connects don't pile up.
+std::atomic_uint32_t connect_attempt{0};
+
+using steady_time = std::chrono::steady_clock::time_point;
+
+// UDP can drop a packet; don't fail a connect on a single lost query
+constexpr uint32_t connect_query_attempts = 3;
+// Queries are only sent from the menus; drop the ones that waited too long
+// (e.g. a connect typed during a match) instead of firing them much later
+constexpr std::chrono::seconds unsent_query_timeout = 10s;
+
+// While the host is still in the menus or loading the map, keep polling it
+// and join as soon as the match is up
+constexpr std::chrono::seconds host_wait_interval = 2s;
+constexpr std::chrono::minutes host_wait_timeout = 3min;
+
+// Switching game mode reloads the frontend, which is slow with several
+// instances running on one PC
+constexpr std::chrono::seconds mode_switch_min_delay = 5s;
+constexpr std::chrono::seconds mode_switch_timeout = 60s;
+
+constexpr const char *connect_icon = "t7_icon_connect_overlays";
+
+// After a join has started, watch whether it gets in. If it falls back to
+// the menus instead, ask the host why, so the player gets the real reason
+// (e.g. the host left the match while we were loading). Main thread only.
+struct join_watch_state {
+  bool active{false};
+  bool left_menus{false};
+  game::net::netadr_t target{};
+  steady_time started{};
+};
+join_watch_state join_watch{};
+constexpr std::chrono::minutes join_watch_timeout = 5min;
+
+// Since when we are in the current match (connected and active), if we are
+std::optional<steady_time> match_active_since;
+
+// Diagnostic: who writes the session max clients while we join. Logs every
+// write to com_maxclients / party_maxplayers (also their per-mode variants)
+// with the calling engine address, so the reset to the lobby default can be
+// fixed where it happens.
+std::atomic_bool watching_session_writes{false};
+
+bool is_session_max_clients_dvar(const game::EngineDependentDvar dvar) {
+  if (!dvar.cl) {
+    return false;
+  }
+
+  static const game::dvarStrHash_t com_hash =
+      game::Dvar_GenerateHash("com_maxclients");
+  static const game::dvarStrHash_t party_hash =
+      game::Dvar_GenerateHash("party_maxplayers");
+  if (dvar.name() == com_hash || dvar.name() == party_hash) {
+    return true;
+  }
+
+  const char *debug_name = dvar.cl->debugName();
+  return debug_name && (std::strstr(debug_name, "maxclients") ||
+                        std::strstr(debug_name, "maxplayers"));
+}
+
+// Once this instance has joined a host, com_maxclients and party_maxplayers
+// stay at the host's value for the rest of the session. The engine (and the
+// UI scripts) set them back to our own lobby's default (18) while connecting
+// and loading, which makes client scripts register different clientfields
+// than the host and gets us dropped. 0: not locked (we never joined anyone,
+// e.g. the host instance).
+std::atomic_int32_t locked_max_clients{0};
+
+// The host's side of the same problem: boiii's in-game UI script raises the
+// host's com_maxclients/party_maxplayers to its lobby default (18) once
+// players connect, and a restart then registers the server's clientfields
+// with that, which no longer matches the clients. The value the running match
+// started with (set by getinfo) is put back right before a restart
+// (restore_host_match_max_clients). Locking it for the whole match instead
+// made the host time out when players connected.
+std::atomic_int32_t host_match_max_clients{0};
+
+int32_t effective_locked_max_clients() { return locked_max_clients.load(); }
+
+bool is_locked_max_clients_dvar(const game::EngineDependentDvar dvar) {
+  if (!dvar.cl) {
+    return false;
+  }
+
+  static const game::dvarStrHash_t com_hash =
+      game::Dvar_GenerateHash("com_maxclients");
+  static const game::dvarStrHash_t party_hash =
+      game::Dvar_GenerateHash("party_maxplayers");
+  return dvar.name() == com_hash || dvar.name() == party_hash;
+}
+
+utils::hook::detour dvar_set_int_hook;
+void dvar_set_int_stub(const game::EngineDependentDvar dvar, int32_t val,
+                       const game::DvarSetSource source) {
+  if (watching_session_writes && is_session_max_clients_dvar(dvar)) {
+    const char *debug_name = dvar.cl->debugName();
+    printf("[Session] write %s (hash %08X) = %d, source %u, from 0x%llX\n",
+           debug_name ? debug_name : "?", dvar.name(), val,
+           static_cast<uint32_t>(source),
+           reinterpret_cast<unsigned long long>(_ReturnAddress()));
+  }
+
+  const int32_t locked = effective_locked_max_clients();
+  if (locked > 0 && val != locked && is_locked_max_clients_dvar(dvar)) {
+    printf("[Session] keeping the host's max clients: %d instead of %d\n",
+           locked, val);
+    val = locked;
+  }
+
+  dvar_set_int_hook.invoke<void>(dvar, val, source);
+}
+
+utils::hook::detour dvar_set_from_string_by_name_hook;
+void dvar_set_from_string_by_name_stub(const char *name, const char *value,
+                                       const bool create_if_missing) {
+  const bool max_clients_dvar =
+      name && (_stricmp(name, "com_maxclients") == 0 ||
+               _stricmp(name, "party_maxplayers") == 0);
+  if (watching_session_writes && max_clients_dvar) {
+    printf("[Session] set %s \"%s\" by name, from 0x%llX\n", name,
+           value ? value : "",
+           reinterpret_cast<unsigned long long>(_ReturnAddress()));
+  }
+
+  const int32_t locked = effective_locked_max_clients();
+  if (locked > 0 && max_clients_dvar && value && atoi(value) != locked) {
+    const std::string locked_str = std::to_string(locked);
+    printf("[Session] keeping the host's %s: %d instead of %s\n", name, locked,
+           value);
+    dvar_set_from_string_by_name_hook.invoke<void>(name, locked_str.c_str(),
+                                                   create_if_missing);
+    return;
+  }
+
+  dvar_set_from_string_by_name_hook.invoke<void>(name, value,
+                                                 create_if_missing);
+}
+
+// While joining, log every change of the values client scripts size their
+// clientfields from, with the connection state at that moment. Shows what
+// resets them during the connect if a "Clientfield Mismatch" still happens.
+void watch_session_values() {
+  static std::optional<int32_t> last_com_maxclients;
+  static std::optional<int32_t> last_party_maxplayers;
+  static int32_t last_game_mode = -1;
+
+  // Runs all the time and on the host too (only prints on a change): a
+  // restart or map change can change the host's values while a joined
+  // client keeps the ones it joined with. Main thread only (the main
+  // pipeline runs in the game frame, after startup).
+
+  const std::optional<int32_t> com_maxclients =
+      game::get_dvar_int("com_maxclients");
+  const std::optional<int32_t> party_maxplayers =
+      game::get_dvar_int("party_maxplayers");
+  const int32_t game_mode =
+      static_cast<int32_t>(game::com::Com_SessionMode_GetGameMode());
+
+  if (com_maxclients != last_com_maxclients ||
+      party_maxplayers != last_party_maxplayers ||
+      game_mode != last_game_mode) {
+    const int32_t connstate =
+        *game::cl::clientConnections != nullptr
+            ? static_cast<int32_t>(
+                  game::cg::clientUIActives->actives[game::LOCAL_CLIENT_0]
+                      .connectionState)
+            : -1;
+    printf("[Session] com_maxclients=%d party_maxplayers=%d gamemode=%d "
+           "(connstate=%d, menus=%d, server=%d)\n",
+           com_maxclients.value_or(-1), party_maxplayers.value_or(-1),
+           game_mode, connstate, game::com::Com_IsRunningUILevel() ? 1 : 0,
+           game::server_running() ? 1 : 0);
+
+    last_com_maxclients = com_maxclients;
+    last_party_maxplayers = party_maxplayers;
+    last_game_mode = game_mode;
+  }
+}
+
+void track_match_time() {
+  const bool active = !game::com::Com_IsRunningUILevel() &&
+                      *game::cl::clientConnections != nullptr &&
+                      game::cg::clientUIActives->actives[game::LOCAL_CLIENT_0]
+                              .connectionState == game::connstate_t::ACTIVE;
+  if (!active) {
+    match_active_since.reset();
+  } else if (!match_active_since) {
+    match_active_since = std::chrono::steady_clock::now();
+  }
+}
 
 std::mutex hostname_mutex;
 std::string cached_server_hostname;
@@ -46,20 +252,58 @@ std::optional<float> cached_server_gun_xp_scale;
 utils::hook::detour live_get_xp_scale_hook;
 utils::hook::detour live_get_gun_xp_scale_hook;
 
-std::string normalize_connect_address(std::string address) {
+// Returns "host:port", or nothing if the address can't be used
+std::optional<std::string> normalize_connect_address(std::string address) {
   utils::string::trim(address);
 
+  // Pasted addresses often come quoted or with a trailing separator
+  while (!address.empty() && (address.back() == ';' || address.back() == '"' ||
+                              address.back() == '\'')) {
+    address.pop_back();
+  }
+  while (!address.empty() &&
+         (address.front() == '"' || address.front() == '\'')) {
+    address.erase(0, 1);
+  }
+  utils::string::trim(address);
+
+  if (address.empty()) {
+    return std::nullopt;
+  }
+
+  // Only IPv4 is supported; "[::1]:27017" or "::1" would otherwise be split
+  // at the wrong colon
   const size_t separator = address.find(':');
-  const std::string host = address.substr(0, separator);
+  if (address.front() == '[' ||
+      (separator != std::string::npos &&
+       address.find(':', separator + 1) != std::string::npos)) {
+    return std::nullopt;
+  }
+
+  std::string host = address.substr(0, separator);
+  std::string port = separator == std::string::npos
+                         ? std::string{}
+                         : address.substr(separator + 1);
+  if (host.empty() || host.find_first_of(" \t") != std::string::npos) {
+    return std::nullopt;
+  }
+
   if (utils::string::to_lower(host) == "localhost") {
-    address.replace(0, host.size(), "127.0.0.1");
+    host = "127.0.0.1";
   }
 
-  if (separator == std::string::npos) {
-    address.append(":" + std::to_string(DEFAULT_SERVER_PORT));
+  // "host:" means the default port too
+  if (port.empty()) {
+    port = std::to_string(DEFAULT_SERVER_PORT);
+  } else {
+    const int32_t value = atoi(port.data());
+    if (value <= 0 || value > 65535 ||
+        port.find_first_not_of("0123456789") != std::string::npos) {
+      return std::nullopt;
+    }
   }
 
-  return address;
+  return host + ":" + port;
 }
 
 std::optional<game::net::netadr_t> dedi_server;
@@ -81,10 +325,12 @@ bool direct_connect = false;
 
 struct server_query {
   bool sent{false};
+  uint32_t attempts{1};
   game::net::netadr_t host{};
-  std::string challenge;
-  query_callback callback;
-  std::chrono::high_resolution_clock::time_point query_time;
+  std::string challenge{};
+  query_callback callback{};
+  std::chrono::high_resolution_clock::time_point created_time{};
+  std::chrono::high_resolution_clock::time_point query_time{};
 };
 
 utils::concurrency::container<std::vector<server_query>> &get_server_queries() {
@@ -122,6 +368,29 @@ void connect_to_lobby(const game::ControllerIndex_t controllerIndex,
   game::cl::CL_ConnectFromLobby(controllerIndex, &info, &addr, public_slots, 0,
                                 mapname.data(), gamemode.data(),
                                 usermap_id.data());
+
+  // Native split-screen: also connect the other local players (guests) on
+  // this instance, each with its own controller (and auth key). Without
+  // this only the first player joins the host.
+  const game::LocalClientNum_t main_client =
+      game::com::Com_ControllerIndex_GetLocalClientNum(controllerIndex);
+  for (game::LocalClientNum_t localClientIdx = game::LOCAL_CLIENT_0;
+       localClientIdx < game::LOCAL_CLIENT_COUNT; localClientIdx++) {
+    if (localClientIdx == main_client ||
+        !game::com::Com_LocalClient_IsBeingUsed(localClientIdx)) {
+      continue;
+    }
+
+    const game::ControllerIndex_t guest_controller =
+        game::com::Com_LocalClient_GetControllerIndex(localClientIdx);
+    printf("Connecting split-screen player (local client %d, controller %d)\n",
+           static_cast<int32_t>(localClientIdx),
+           static_cast<int32_t>(guest_controller));
+    game::cl::CL_ConnectFromLobby(guest_controller, &info, &addr, public_slots,
+                                  0, mapname.data(), gamemode.data(),
+                                  usermap_id.data());
+  }
+
   direct_connect = false;
 }
 
@@ -427,27 +696,101 @@ void update_server_lobby() {
   }
 }
 
+// Session settings the host's match runs with. Client scripts register their
+// clientfields based on them, so they have to be the host's: any difference
+// gets the client kicked with "Clientfield Mismatch" (e.g. a private zombies
+// match registers gobblegum fields a public one doesn't).
+struct host_session {
+  game::eGameModes game_mode{game::eGameModes::MATCHMAKING_PLAYLIST};
+  int32_t max_clients{0}; // 0: unknown, keep ours
+};
+
+// Per-player clientfields are sized from the max client count. The real
+// lobby gives every member the host's value; we skip the lobby, so take the
+// host's value right before connecting and keep it (locked_max_clients).
+// Main thread only.
+constexpr const char *session_max_client_dvars[] = {"com_maxclients",
+                                                    "party_maxplayers"};
+
+// Our lobbies too, the way the game sizes them (SetLobbyMaxClients with
+// party_maxplayers), so nothing derives the old lobby size from them
+void set_lobby_max_clients(const int32_t max_clients) {
+  const std::string code = utils::string::va(
+      "for _, t in ipairs({Enum.LobbyType.LOBBY_TYPE_PRIVATE, "
+      "Enum.LobbyType.LOBBY_TYPE_GAME}) do "
+      "pcall(Engine.SetLobbyMaxClients, t, %d) end",
+      max_clients);
+  if (ui_scripting::run_lua(code, "boiii_lobby_max_clients")) {
+    printf("Lobby max clients set to %d\n", max_clients);
+  }
+}
+
+void apply_host_max_clients(const int32_t max_clients) {
+  if (max_clients <= 0) {
+    return;
+  }
+
+  // Log what happens to the values from here until we are in the match
+  watching_session_writes = true;
+
+  // From now on keep them at the host's value (also after a later join, to
+  // that host's value)
+  locked_max_clients = max_clients;
+
+  for (const char *dvar : session_max_client_dvars) {
+    const std::optional<int32_t> current = game::get_dvar_int(dvar);
+    if (!current || *current == max_clients) {
+      continue;
+    }
+
+    printf("Using the host's %s: %d (was %d)\n", dvar, max_clients, *current);
+    game::set_dvar_int(dvar, max_clients, true);
+  }
+
+  set_lobby_max_clients(max_clients);
+}
+
 void connect_in_mode(const game::net::netadr_t &addr, const game::eModes mode,
                      const std::string_view &mapname,
                      const std::string_view &gametype,
                      const std::string_view &usermap_id,
                      const std::string_view &mod_id,
-                     const std::string_view &lobby_view) {
+                     const std::string_view &lobby_view,
+                     const host_session &session, const uint32_t attempt) {
   // The lambdas below run later, so they need their own copies
   const std::string map{mapname}, type{gametype}, usermap{usermap_id},
       mod{mod_id}, lobby{lobby_view};
   const auto connect = [=] {
-    game::com::Com_SessionMode_SetGameMode(
-        game::eGameModes::MATCHMAKING_PLAYLIST);
+    // A newer connect replaced this one
+    if (attempt != connect_attempt.load()) {
+      return;
+    }
+
     const auto connect_direct = [=] {
+      if (attempt != connect_attempt.load()) {
+        return;
+      }
+
+      // Joining through the real lobby would put us in the host's session;
+      // here we skip the lobby, so take the host's game mode (instead of
+      // always assuming a public match) and max clients
+      game::com::Com_SessionMode_SetGameMode(session.game_mode);
+      apply_host_max_clients(session.max_clients);
+
       connect_to_lobby(
           game::com::Com_LocalClient_GetControllerIndex(game::LOCAL_CLIENT_0),
           addr, map, type, usermap, mod);
+
+      join_watch = {true, false, addr, std::chrono::steady_clock::now()};
     };
     if (lobby.empty()) {
       with_party_lobby(connect_direct);
       return;
     }
+
+    // Joining the host's lobby: the lobby gives us its session settings
+    game::com::Com_SessionMode_SetGameMode(
+        game::eGameModes::MATCHMAKING_PLAYLIST);
     nat::join_match_lobby(addr, lobby == "party" ? [] {
       printf("Connect failed: Could not join their party.\n");
       toast::show("Connect failed", "Could not join their party",
@@ -460,10 +803,15 @@ void connect_in_mode(const game::net::netadr_t &addr, const game::eModes mode,
     return;
   }
 
+  // Switching mode reloads the frontend, which is slow with several
+  // instances running on one PC
   launch_mode(mode);
-  const auto deadline = std::chrono::steady_clock::now() + 15s;
+  const auto deadline = std::chrono::steady_clock::now() + mode_switch_timeout;
   scheduler::schedule(
       [=] {
+        if (attempt != connect_attempt.load()) {
+          return scheduler::cond_end;
+        }
         if (ensure_networkmode_online() &&
             game::com::Com_SessionMode_IsMode(mode)) {
           connect();
@@ -480,11 +828,78 @@ void connect_in_mode(const game::net::netadr_t &addr, const game::eModes mode,
       scheduler::main, 250ms);
 }
 
-void handle_connect_query_response(const bool success,
+void handle_connect_query_response(uint32_t attempt,
+                                   std::optional<steady_time> waiting_since,
+                                   bool success,
                                    const game::net::netadr_t &target,
-                                   const utils::info_string &info,
-                                   uint32_t ping) {
+                                   const utils::info_string &info);
+
+// Queries the server for a connect and handles the answer on the main thread
+void query_for_connect(const uint32_t attempt,
+                       const game::net::netadr_t &target,
+                       const std::optional<steady_time> waiting_since) {
+  query_server(
+      target,
+      [attempt, waiting_since](const bool success,
+                               const game::net::netadr_t &host,
+                               const utils::info_string &info, uint32_t) {
+        scheduler::once(
+            [=] {
+              handle_connect_query_response(attempt, waiting_since, success,
+                                            host, info);
+            },
+            scheduler::main);
+      },
+      connect_query_attempts);
+}
+
+void wait_for_host(const uint32_t attempt, const game::net::netadr_t &target,
+                   const steady_time since) {
+  if (std::chrono::steady_clock::now() - since > host_wait_timeout) {
+    const std::string name = get_server_hostname();
+    const std::string msg =
+        (name.empty() ? std::string("That player") : name) +
+        " did not start a match in time. Connect again once they are in a "
+        "game.";
+    printf("Connect failed: %s\n", msg.c_str());
+    game::ui::UI_OpenErrorPopupWithMessage(game::LOCAL_CLIENT_0,
+                                           game::errorCode::UI, msg.c_str());
+    return;
+  }
+
+  scheduler::once(
+      [=] {
+        if (attempt != connect_attempt.load()) {
+          return;
+        }
+
+        // Started a match of our own in the meantime
+        if (!game::com::Com_IsRunningUILevel()) {
+          printf("Stopped waiting for the host: no longer in the menus\n");
+          return;
+        }
+
+        query_for_connect(attempt, target, since);
+      },
+      scheduler::main, host_wait_interval);
+}
+
+void handle_connect_query_response(
+    const uint32_t attempt, const std::optional<steady_time> waiting_since,
+    const bool success, const game::net::netadr_t &target,
+    const utils::info_string &info) {
+  // A newer connect replaced this one
+  if (attempt != connect_attempt.load()) {
+    return;
+  }
+
   if (!success) {
+    if (waiting_since) {
+      // A host that is loading the map doesn't answer queries; keep waiting
+      wait_for_host(attempt, target, *waiting_since);
+      return;
+    }
+
     const std::string msg = utils::string::va(
         "No response from server %u.%u.%u.%u:%hu", target.ipv4.a, target.ipv4.b,
         target.ipv4.c, target.ipv4.d, target.port);
@@ -494,6 +909,15 @@ void handle_connect_query_response(const bool success,
                                   "a firewall is blocking UDP port %hu.",
                                   target.port),
                 "t7_icon_connect_overlays");
+    return;
+  }
+
+  // Our own port answered (127.0.0.1, our LAN IP, a hostname for this PC...):
+  // the XUID catches every way of addressing ourselves
+  if (strtoull(info.get("xuid").data(), nullptr, 16) == auth::get_guid()) {
+    const char *msg = "That address is this game. Connect to another player.";
+    printf("Connect failed: %s\n", msg);
+    toast::show("Connect failed", msg, connect_icon);
     return;
   }
 
@@ -510,18 +934,20 @@ void handle_connect_query_response(const bool success,
     cached_server_gun_xp_scale = parse_scale(info.get("gunxpscale"));
   }
 
-  if (atoi(info.get("protocol").data()) != PROTOCOL) {
-    const char *msg = "Invalid protocol.";
-    printf("Connect failed: %s\n", msg);
-    toast::show("Connect failed", msg, "t7_icon_connect_overlays");
-    return;
-  }
-
   const int32_t sub_protocol = atoi(info.get("sub_protocol").data());
-  if (sub_protocol != SUB_PROTOCOL && sub_protocol != (SUB_PROTOCOL - 1)) {
-    const char *msg = "Invalid sub-protocol.";
-    printf("Connect failed: %s\n", msg);
-    toast::show("Connect failed", msg, "t7_icon_connect_overlays");
+  if (atoi(info.get("protocol").data()) != PROTOCOL ||
+      (sub_protocol != SUB_PROTOCOL && sub_protocol != (SUB_PROTOCOL - 1))) {
+    const std::string host_version = info.get("shortversion");
+    const std::string msg =
+        host_version.empty()
+            ? std::string("The host runs an incompatible BOIII version "
+                          "(you run " SHORTVERSION ").")
+            : "Version mismatch: the host runs BOIII " + host_version +
+                  ", you run " SHORTVERSION ".";
+    printf("Connect failed: %s (protocol %s/%s, ours %d/%d)\n", msg.c_str(),
+           info.get("protocol").data(), info.get("sub_protocol").data(),
+           PROTOCOL, SUB_PROTOCOL);
+    toast::show("Connect failed", msg, connect_icon);
     return;
   }
 
@@ -531,6 +957,59 @@ void handle_connect_query_response(const bool success,
     printf("Connect failed: %s\n", msg);
     toast::show("Connect failed", msg, "t7_icon_connect_overlays");
     return;
+  }
+
+  // Joining a player who is still in the menus crashes, so wait until their
+  // match is up and join then. Hosts on older builds don't report in_match;
+  // let those through. A host in the menus with an open party is joined in
+  // its lobby instead (connect_in_mode, "lobby" == "party").
+  if (!is_connecting_to_dedi.load() && info.get("in_match") == "0" &&
+      info.get("lobby") != "party") {
+    if (!waiting_since) {
+      const std::string name = info.get("hostname");
+      const std::string msg =
+          (name.empty() ? std::string("The host") : name) +
+          " is not in a game yet. Joining when the match starts.";
+      printf("%s\n", msg.c_str());
+      toast::show("Waiting for host", msg, connect_icon);
+    }
+
+    wait_for_host(attempt, target,
+                  waiting_since.value_or(std::chrono::steady_clock::now()));
+    return;
+  }
+
+  // Every local player (split-screen guests too) needs a slot. Without this
+  // check a full server only fails late, during the join.
+  const std::string clients_str = info.get("clients");
+  const std::string host_max_str = info.get("host_maxclients");
+  const int32_t max_clients = atoi(
+      (host_max_str.empty() ? info.get("sv_maxclients") : host_max_str).data());
+  if (!clients_str.empty() && max_clients > 0) {
+    int32_t local_players = 0;
+    for (game::LocalClientNum_t localClientIdx = game::LOCAL_CLIENT_0;
+         localClientIdx < game::LOCAL_CLIENT_COUNT; localClientIdx++) {
+      if (game::com::Com_LocalClient_IsBeingUsed(localClientIdx)) {
+        ++local_players;
+      }
+    }
+
+    const int32_t clients = atoi(clients_str.data());
+    if (clients + std::max(local_players, 1) > max_clients) {
+      const std::string msg =
+          local_players > 1
+              ? utils::string::va("Server is full (%d/%d, you need %d slots).",
+                                  clients, max_clients, local_players)
+              : utils::string::va("Server is full (%d/%d).", clients,
+                                  max_clients);
+      printf("Connect failed: %s\n", msg.c_str());
+      toast::show("Connect failed", msg, connect_icon);
+      return;
+    }
+  }
+
+  if (waiting_since) {
+    toast::show("Joining", info.get("hostname"), connect_icon);
   }
 
   // Verify network password
@@ -600,11 +1079,32 @@ void handle_connect_query_response(const bool success,
   // const game::XUID xuid = strtoull(info.get("xuid").data(), nullptr, 16);
 
   // Stock maps have no usermap entry, so the id stays empty
-  const game::ugc::OptionalUGCItemRef usermap_item =
+  game::ugc::OptionalUGCItemRef usermap_item =
       game::ugc::UGC_GetUsermapByInternalName(mapname);
+  // Hosts launch workshop maps by their workshop id, so mapname can be that
+  // id ("2910206016") rather than the internal name ("zm_coast"); look it up
+  // by id too, or an installed map is reported as missing
+  if (!usermap_item.has_value() && utils::string::is_numeric(mapname)) {
+    usermap_item = game::ugc::UGC_GetUsermapByPublisherId(mapname.c_str());
+  }
   const std::string usermap_id =
       usermap_item.has_value() ? usermap_item->get().publisherId : "";
   const std::string addr_str = target.toString();
+
+  // Player-hosted matches: same game mode as the host (private vs public).
+  // Dedicated servers keep the public match mode they always used.
+  host_session session{};
+  if (const std::string host_gamemode = info.get("gamemode");
+      !is_connecting_to_dedi.load() && !host_gamemode.empty()) {
+    const auto parsed =
+        static_cast<game::eGameModes>(std::atoi(host_gamemode.data()));
+    if (parsed == game::eGameModes::MATCHMAKING_PLAYLIST ||
+        parsed == game::eGameModes::MATCHMAKING_MANUAL) {
+      session.game_mode = parsed;
+    }
+  }
+  session.max_clients = atoi(info.get("host_maxclients").data());
+
   scheduler::once(
       [=] {
         // Always save latest address for mod reconnect (mod unload/reload)
@@ -614,8 +1114,10 @@ void handle_connect_query_response(const bool success,
             (workshop::check_valid_usermap_id(mapname, usermap_id, workshop_id,
                                               base_uri) &&
              workshop::check_valid_mod_id(mod_id, {}, base_uri))) {
+          printf("Joining with the host's game mode: %d\n",
+                 static_cast<int32_t>(session.game_mode));
           connect_in_mode(target, mode, mapname, gametype, usermap_id, mod_id,
-                          lobby);
+                          lobby, session, attempt);
         } else {
           const char *msg = utils::string::va(
               "Missing or invalid workshop/map dependencies for server %s.",
@@ -630,17 +1132,172 @@ void handle_connect_query_response(const bool success,
       scheduler::main);
 }
 
+void report_failed_join(const game::net::netadr_t &target) {
+  const uint32_t attempt = connect_attempt.load();
+  query_server(
+      target,
+      [attempt](const bool success, const game::net::netadr_t &,
+                const utils::info_string &info, uint32_t) {
+        const bool host_left = success && info.get("in_match") == "0";
+        scheduler::once(
+            [=] {
+              if (attempt != connect_attempt.load()) {
+                return;
+              }
+
+              // Otherwise the host is still in its match; the engine's own
+              // error explains the failure
+              const char *msg =
+                  !success ? "The host stopped responding (they may have "
+                             "closed the game)."
+                  : host_left
+                      ? "The host left the match while you were joining."
+                      : nullptr;
+              if (msg) {
+                printf("Join failed: %s\n", msg);
+                toast::show("Join failed", msg, connect_icon);
+              }
+            },
+            scheduler::main);
+      },
+      connect_query_attempts);
+}
+
+void update_join_watch() {
+  if (!join_watch.active) {
+    // The host's max clients stay (locked_max_clients); nothing to restore
+    return;
+  }
+
+  if (std::chrono::steady_clock::now() - join_watch.started >
+      join_watch_timeout) {
+    join_watch.active = false;
+    return;
+  }
+
+  // What client scripts see when they register their clientfields; compare
+  // with the host's if a "Clientfield Mismatch" still happens
+  const auto log_session = [](const char *when) {
+    printf("[Session] %s: mode=%d gamemode=%d com_maxclients=%d "
+           "party_maxplayers=%d\n",
+           when, static_cast<int32_t>(game::com::Com_SessionMode_GetMode()),
+           static_cast<int32_t>(game::com::Com_SessionMode_GetGameMode()),
+           game::get_dvar_int("com_maxclients").value_or(-1),
+           game::get_dvar_int("party_maxplayers").value_or(-1));
+  };
+
+  if (!game::com::Com_IsRunningUILevel()) {
+    // Loading or in the match
+    if (!join_watch.left_menus) {
+      log_session("loading the host's match");
+    }
+    join_watch.left_menus = true;
+    if (*game::cl::clientConnections != nullptr &&
+        game::cg::clientUIActives->actives[game::LOCAL_CLIENT_0]
+                .connectionState == game::connstate_t::ACTIVE) {
+      log_session("in the match");
+      watching_session_writes = false;
+      join_watch.active = false;
+    }
+    return;
+  }
+
+  // Back in the menus without ever getting into the match
+  if (join_watch.left_menus) {
+    join_watch.active = false;
+    report_failed_join(join_watch.target);
+  }
+}
+
+bool is_in_match() {
+  return !game::com::Com_IsRunningUILevel() &&
+         *game::cl::clientConnections != nullptr &&
+         game::cg::clientUIActives->actives[game::LOCAL_CLIENT_0]
+                 .connectionState == game::connstate_t::ACTIVE;
+}
+
+void connect_finish(const game::net::netadr_t &target);
+
+// Runs the connect once the menus are up. Used when connect arrives while the
+// game is on its way back to the menus, e.g. the automatic reconnect after a
+// "missing map" error or after being dropped by the host.
+void connect_when_in_menus(const uint32_t attempt,
+                           const game::net::netadr_t &target,
+                           const steady_time since) {
+  if (attempt != connect_attempt.load()) {
+    return;
+  }
+
+  if (game::com::Com_IsRunningUILevel()) {
+    connect_finish(target);
+    return;
+  }
+
+  if (is_in_match() || std::chrono::steady_clock::now() - since > 60s) {
+    printf("Connect to %s dropped: the menus did not load\n",
+           network::address_to_string(target).c_str());
+    return;
+  }
+
+  scheduler::once([=] { connect_when_in_menus(attempt, target, since); },
+                  scheduler::main, 500ms);
+}
+
 void connect_finish(const game::net::netadr_t &target) {
+  if (!game::com::Com_IsRunningUILevel()) {
+    // Server queries are only sent from the menus, so a connect from inside
+    // a match would just time out with a misleading "No response"
+    if (is_in_match()) {
+      const char *msg = "Leave the current match first, then connect.";
+      printf("Connect failed: %s\n", msg);
+      toast::show("Connect failed", msg, connect_icon);
+      return;
+    }
+
+    // Loading or going back to the menus: connect once they are up
+    const uint32_t attempt = ++connect_attempt;
+    connect_when_in_menus(attempt, target, std::chrono::steady_clock::now());
+    return;
+  }
+
+  // Pressing connect again while the join to that host is already under way
+  // would restart it. (In the menus the client is connected to the local
+  // frontend server, so the address check is what matters here.)
+  if (*game::cl::clientConnections != nullptr &&
+      game::cg::clientUIActives->actives[game::LOCAL_CLIENT_0]
+              .connectionState >= game::connstate_t::CHALLENGING &&
+      get_connected_server(game::LOCAL_CLIENT_0) == target) {
+    printf("Already connecting to %s\n",
+           network::address_to_string(target).c_str());
+    toast::show("Connecting", "Already joining that host", connect_icon);
+    return;
+  }
+
+  const uint32_t attempt = ++connect_attempt;
+  join_watch.active = false;
   connect_host = target;
 
   profile_infos::clear_profile_infos();
 
-  query_server(connect_host, handle_connect_query_response);
+  // Always ask the server itself, also when it belongs to a friend: their
+  // rich presence can be stale and skipping the query would skip the
+  // version, password, dependency and "host is still in the menus" checks
+  query_for_connect(attempt, target, std::nullopt);
 }
 
 void connect_stub(const char *address) {
-  if (address != nullptr) {
-    const std::string address_copy = normalize_connect_address(address);
+  if (address) {
+    const std::optional<std::string> normalized =
+        normalize_connect_address(address);
+    if (!normalized) {
+      printf("Connect failed: invalid address \"%s\"\n", address);
+      toast::show("Connect failed",
+                  "Invalid address. Use ip:port, e.g. 127.0.0.1:27018",
+                  connect_icon);
+      return;
+    }
+
+    const std::string &address_copy = *normalized;
 
     const auto friend_unavailable = [](const char *reason) {
       printf("Connect failed: %s\n", reason);
@@ -699,7 +1356,11 @@ void connect_stub(const char *address) {
 void send_server_query(server_query &query) {
   query.sent = true;
   query.query_time = std::chrono::high_resolution_clock::now();
-  query.challenge = utils::cryptography::random::get_challenge();
+  // Resends keep the challenge, so a late answer to an earlier send still
+  // counts
+  if (query.challenge.empty()) {
+    query.challenge = utils::cryptography::random::get_challenge();
+  }
 
   network::send(query.host, "getInfo", query.challenge);
 }
@@ -733,6 +1394,9 @@ void handle_info_response(const game::net::netadr_t &target,
         std::chrono::duration_cast<std::chrono::milliseconds>(ping).count();
 
     query.callback(true, query.host, info, static_cast<uint32_t>(ping_ms));
+  } else {
+    // Replies to the LAN broadcast come from addresses we never queried
+    local_instances::handle_broadcast_response(target, info);
   }
 }
 
@@ -748,6 +1412,12 @@ void cleanup_queried_servers() {
       for (std::vector<server_query>::iterator i = server_queries.begin();
            i != server_queries.end();) {
         if (!i->sent) {
+          if (now - i->created_time >= unsent_query_timeout) {
+            removed_queries.emplace_back(std::move(*i));
+            i = server_queries.erase(i);
+            continue;
+          }
+
           if (++sent_queries < 40) {
             send_server_query(*i);
           }
@@ -757,6 +1427,13 @@ void cleanup_queried_servers() {
         }
 
         if ((now - i->query_time) < 1s) {
+          ++i;
+          continue;
+        }
+
+        if (i->attempts > 1) {
+          --i->attempts;
+          send_server_query(*i);
           ++i;
           continue;
         }
@@ -776,19 +1453,129 @@ void cleanup_queried_servers() {
 
 void connect(const game::net::netadr_t &target) { connect_finish(target); }
 
-void query_server(const game::net::netadr_t &host, query_callback callback) {
+void query_server(const game::net::netadr_t &host, query_callback callback,
+                  const uint32_t attempts) {
   server_query query{};
   query.sent = false;
+  query.attempts = std::max(attempts, 1u);
   query.host = host;
   query.callback = std::move(callback);
+  query.created_time = std::chrono::high_resolution_clock::now();
 
   get_server_queries().access([&](std::vector<server_query> &server_queries) {
     server_queries.emplace_back(std::move(query));
   });
 }
 
+namespace {
+// After e.g. a restart with big mods, a client still reloading the map can
+// get dropped by the host (EXE_ERR_RELIABLE_CYCLED_OUT) and had to connect
+// again by hand. Rejoin automatically, but never after a kick/ban or a
+// reason a retry can't fix, and only a few times so it can't loop.
+constexpr size_t max_auto_reconnects = 3;
+constexpr std::chrono::minutes auto_reconnect_window = 5min;
+std::mutex auto_reconnect_mutex;
+std::vector<steady_time> auto_reconnect_times;
+
+bool reason_allows_reconnect(const std::string &reason) {
+  const std::string upper = utils::string::to_upper(reason);
+  for (const char *blocked : {"KICK", "BAN", "PASSWORD", "FULL", "PROTOCOL",
+                              "VERSION", "MISMATCH", "INVALID", "CHEAT"}) {
+    if (upper.find(blocked) != std::string::npos) {
+      return false;
+    }
+  }
+  return true;
+}
+} // namespace
+
+void on_server_disconnect(const game::LocalClientNum_t localClientNum,
+                          const game::net::netadr_t &from, const char *reason) {
+  // Split-screen guests rejoin together with the main player
+  if (localClientNum != game::LOCAL_CLIENT_0 || !network::is_ip_address(from) ||
+      !(from == connect_host || from == get_connected_server(localClientNum))) {
+    return;
+  }
+
+  const std::string reason_str = reason ? reason : "";
+  if (!reason_allows_reconnect(reason_str)) {
+    printf("Disconnected by the host (%s), not reconnecting\n",
+           reason_str.c_str());
+    return;
+  }
+
+  // Dropped while joining or right after (e.g. a clientfield mismatch): a
+  // rejoin would just get the same result, so only rejoin after having
+  // actually played in the match for a while
+  const bool played_a_while =
+      match_active_since &&
+      std::chrono::steady_clock::now() - *match_active_since >= 30s;
+  if (!played_a_while) {
+    printf("Disconnected by the host while joining (%s), not reconnecting\n",
+           reason_str.c_str());
+    return;
+  }
+
+  {
+    const steady_time now = std::chrono::steady_clock::now();
+    std::lock_guard lock(auto_reconnect_mutex);
+    std::erase_if(auto_reconnect_times, [now](const steady_time time) {
+      return now - time > auto_reconnect_window;
+    });
+    if (auto_reconnect_times.size() >= max_auto_reconnects) {
+      printf("Disconnected by the host (%s), not reconnecting: already "
+             "reconnected %zu times in the last %lld minutes\n",
+             reason_str.c_str(), auto_reconnect_times.size(),
+             static_cast<long long>(auto_reconnect_window.count()));
+      return;
+    }
+    auto_reconnect_times.push_back(now);
+  }
+
+  printf("Disconnected by the host (%s), reconnecting\n", reason_str.c_str());
+  toast::show("Reconnecting",
+              "Dropped by the host, rejoining. Type cancelconnect to stop.",
+              connect_icon);
+
+  // Connects once the menus are up and, if the host is back in the menus,
+  // waits for their next match
+  const game::net::netadr_t target = from;
+  scheduler::once([target] { connect_finish(target); }, scheduler::main, 2s);
+}
+
+void set_host_match_max_clients(const int32_t max_clients) {
+  host_match_max_clients = max_clients;
+}
+
+void restore_host_match_max_clients() {
+  const int32_t max_clients = host_match_max_clients.load();
+  if (max_clients <= 0) {
+    return;
+  }
+
+  for (const char *dvar : session_max_client_dvars) {
+    const std::optional<int32_t> current = game::get_dvar_int(dvar);
+    if (current && *current != max_clients) {
+      printf("[Session] restart: %s back to the match's %d (was %d)\n", dvar,
+             max_clients, *current);
+      game::set_dvar_int(dvar, max_clients, true);
+    }
+  }
+}
+
+void cancel_connect() {
+  ++connect_attempt;
+  printf("Connect cancelled\n");
+}
+
 game::net::netadr_t
 get_connected_server(game::LocalClientNum_t localClientNum) {
+  // The connection array is allocated during startup; before that there is
+  // no server
+  if (*game::cl::clientConnections == nullptr) {
+    return game::net::netadr_t{{}, {}, game::net::netadrtype_t::BAD, {}};
+  }
+
   return game::cl::CL_GetLocalClientConnection(localClientNum)->serverAddress;
 }
 
@@ -874,6 +1661,15 @@ struct component final : client_component {
 
     network::on("infoResponse", handle_info_response);
 
+    dvar_set_int_hook.create(game::_Dvar_SetIntFromSource.get(),
+                             dvar_set_int_stub);
+    dvar_set_from_string_by_name_hook.create(
+        game::Dvar_SetFromStringByName.get(),
+        dvar_set_from_string_by_name_stub);
+
+    // Stops a connect that is waiting for the host or for a mode switch
+    command::add("cancelconnect", [] { cancel_connect(); });
+
     scheduler::loop(cleanup_queried_servers, scheduler::async, 100ms);
     scheduler::loop(update_server_lobby, scheduler::main, 500ms);
 
@@ -881,6 +1677,11 @@ struct component final : client_component {
                        sv_map_in_mode_stub<&sv_map_hook>);
     sv_devmap_hook.create(game::sv::SV_DevMap_f.get(),
                           sv_map_in_mode_stub<&sv_devmap_hook>);
+    scheduler::loop(update_join_watch, scheduler::main, 500ms);
+    scheduler::loop(track_match_time, scheduler::main, 500ms);
+    // Main thread only: printing from another thread during startup crashes
+    // inside the engine's console
+    scheduler::loop(watch_session_values, scheduler::main);
   }
 
   void pre_destroy() override {

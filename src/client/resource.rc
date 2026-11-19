@@ -74,6 +74,10 @@ DW_FASTFILE           RCDATA "resources/dw/core_ffotd_tu32_593.ff"
 DW_KEYS               RCDATA "resources/dw/keys.txt"
 DW_QOSCONFIG          RCDATA "resources/dw/qosconfig4.csv"
 
+LUA_CONNECT_MENU      RCDATA "resources/lua/connect_menu.lua"
+LUA_SKIP_TITLE        RCDATA "resources/lua/skip_title.lua"
+LUA_TOAST_FIX         RCDATA "resources/lua/toast_fix.lua"
+
 #ifdef _DEBUG
 TLS_DLL               RCDATA "../../build/bin/x64/Debug/tlsdll.dll"
 #else

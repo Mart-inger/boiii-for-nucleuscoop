@@ -13,6 +13,8 @@
 
 #include "ui_scripting.hpp"
 
+#include <resource.hpp>
+
 #include <component/command.hpp>
 #include <component/getinfo.hpp>
 #include <component/scheduler.hpp>
@@ -24,6 +26,7 @@
 #include <utils/flags.hpp>
 #include <utils/hook.hpp>
 #include <utils/io.hpp>
+#include <utils/nt.hpp>
 #include <utils/string.hpp>
 
 #include <frozen/string.h>
@@ -681,6 +684,17 @@ void start() {
   const char *folder = game::is_server() ? "lobby_scripts/" : "ui_scripts/";
   load_scripts((game::get_data_path() / folder).string());
   load_scripts((host.get_folder() / "boiii" / folder).string());
+
+  if (!game::is_server()) {
+    // Built-in connect menu for other instances on this machine
+    load_script("boiii/connect_menu.lua",
+                utils::nt::load_resource(LUA_CONNECT_MENU));
+    // Straight to the Campaign / Multiplayer / Zombies selection
+    load_script("boiii/skip_title.lua",
+                utils::nt::load_resource(LUA_SKIP_TITLE));
+    // The game's toast widget errors on a toast shown while another is up
+    load_script("boiii/toast_fix.lua", utils::nt::load_resource(LUA_TOAST_FIX));
+  }
 }
 
 void try_start() {
@@ -1037,6 +1051,10 @@ void patch_unsafe_lua_functions() {
   }
 }
 } // namespace
+
+bool run_lua(const std::string &code, const char *chunk_name) {
+  return execute_raw_lua(code, chunk_name);
+}
 
 luaReturnCount_e main_handler(lua_State *state) {
   HksObject *value = &state->m_apistack.base[-1];
@@ -1576,10 +1594,12 @@ std::string remove_extension(const std::string &basename) {
                                          : basename.substr(0, lastExtIdx);
 }
 
+// AAEUnified: the T7Overcharged plugin the newer All-around Enhancement
+// versions ship; loading it froze the game while the zombies frontend loaded
 inline constexpr const frozen::string BLACKLISTED_DLL_ARRAY[] = {
     "T7Overcharged",   "discord_game_sdk", "AAE",         "T7Recharged",
     "CoDAxiosUtility", "discord-rpc",      "LibCurlShim", "arxan",
-    "dependencies"};
+    "dependencies",    "AAEUnified"};
 inline constexpr const frozen_case_insensitive_unordered_set BLACKLISTED_DLLS =
     make_frozen_case_insensitive_unordered_set(BLACKLISTED_DLL_ARRAY);
 
@@ -1737,6 +1757,10 @@ luaReturnCount_e load_dll_skip_blacklisted(lua_State *s, const char *filename,
   game::trace(R"(Calling load_dll with filename: "{}", func_name: "{}")",
               filename ? filename : "NULL", func_name ? func_name : "NULL");
 #endif
+  // Also in release builds: a mod DLL that hangs or crashes the game is
+  // otherwise invisible in the console log
+  printf("[Lua] Loading mod DLL \"%s\" (%s)\n", filename ? filename : "NULL",
+         func_name ? func_name : "NULL");
   if (filename) {
     patch_mod_module(filename);
   }

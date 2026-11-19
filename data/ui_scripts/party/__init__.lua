@@ -1,13 +1,24 @@
 local modeInfo = LobbyData:UITargetFromId(Engine.GetLobbyUIScreen())
 local maxClients = modeInfo.maxClients
 
+-- Only an instance running the server (the host, or the menus, which always
+-- run a local one) may size the session from its own lobby. A player joining
+-- someone else's match reloads these scripts while connecting: overwriting
+-- the host's max clients with its own lobby's made its client scripts
+-- register different clientfields, and the host dropped it with
+-- "Clientfield Mismatch".
+local runsServer = true
+pcall(function()
+  runsServer = Engine.DvarBool(0, "sv_running") == true
+end)
+
 -- Disable setting party privacy in menu. Auto set to open + max.
 Engine.SetDvar("partyprivacyenabled", 0)
 Engine.SetDvar("tu4_partyprivacyuseglobal", 0)
 Engine.SetDvar("tu4_partyprivacyluacheck", 0)
 
 -- Fix for invisible bots in custom games
-if maxClients >= 1 then
+if runsServer and maxClients >= 1 then
   Engine.SetDvar("party_maxplayers", maxClients)
 end
 
@@ -25,7 +36,9 @@ CoD.IsTeamChangeAllowed = function()
 end
 
 -- Set com_maxclients InGame so players can join via direct connect (default from lobbydata)
-Engine.SetDvar("com_maxclients", maxClients)
+if runsServer then
+  Engine.SetDvar("com_maxclients", maxClients)
+end
 
 require("datasources_start_menu_game_options")
 

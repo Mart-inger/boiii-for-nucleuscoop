@@ -695,10 +695,13 @@ void remember_browser_route(const game::XUID steam_id,
 }
 
 game::XUID find_browser_route(const std::string &address) {
-  const game::net::netadr_t parsed = network::address_from_string(address);
-  if (!network::is_ip_address(parsed))
+  // Routes are stored by IP. Called on the main thread from connect, so a
+  // hostname must not trigger a (blocking) DNS lookup here.
+  const std::optional<game::net::netadr_t> parsed =
+      network::parse_ip_address(address);
+  if (!parsed)
     return 0;
-  const std::string normalized = network::address_to_string(parsed);
+  const std::string normalized = network::address_to_string(*parsed);
   std::lock_guard lock(browser_routes_mutex);
   if (browser_routes.contains(normalized)) {
     return browser_routes[normalized];

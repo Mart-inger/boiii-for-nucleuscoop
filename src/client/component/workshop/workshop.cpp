@@ -11,6 +11,7 @@
 #include <utils/http.hpp>
 #include <utils/io.hpp>
 #include <utils/string.hpp>
+#include <utils/thread.hpp>
 
 #include <component/download_overlay.hpp>
 #include <component/fastdl.hpp>
@@ -556,11 +557,9 @@ void supplement_ugc_from_workshop(game::ZoneType zoneType) {
   }
 
   std::error_code ec;
-  const std::filesystem::path current_dir = std::filesystem::current_path();
-  const std::filesystem::path steamapps =
-      current_dir.parent_path().parent_path();
-  const std::filesystem::path workshop_path =
-      steamapps / "workshop" / "content" / game::APP_ID_STR;
+  // Also found from a Nucleus Co-op instance folder (see path.cpp)
+  const std::filesystem::path &workshop_path =
+      path::installed_workshop_content_directory();
 
   if (!std::filesystem::exists(workshop_path, ec)) {
     return;
@@ -607,6 +606,28 @@ void supplement_ugc_from_workshop(game::ZoneType zoneType) {
 
     if (!doc.HasMember("Type") || !doc["Type"].IsString() ||
         strcmp(doc["Type"].GetString(), ugc_type_str) != 0) {
+      continue;
+    }
+
+    // The same item can already be listed from the game's usermaps/mods
+    // folder (e.g. symlinked there for Nucleus Co-op); don't list it twice
+    const char *publisher_id =
+        doc.HasMember("PublisherID") && doc["PublisherID"].IsString()
+            ? doc["PublisherID"].GetString()
+            : "";
+    const char *folder_name =
+        doc.HasMember("FolderName") && doc["FolderName"].IsString()
+            ? doc["FolderName"].GetString()
+            : "";
+    bool already_listed = false;
+    for (uint32_t i = 0; i < count && !already_listed; ++i) {
+      const game::ugc::UGCItem &existing = pool->data[i];
+      already_listed = (*publisher_id &&
+                        std::strcmp(existing.publisherId, publisher_id) == 0) ||
+                       (*folder_name &&
+                        std::strcmp(existing.internalName, folder_name) == 0);
+    }
+    if (already_listed) {
       continue;
     }
 
@@ -1150,21 +1171,26 @@ workshop_info get_steam_workshop_info(const std::string_view &workshop_id) {
 
 void offer_download(game::ZoneType zoneType, const std::string_view &name,
                     const std::string_view &workshop_id) {
-  const workshop_info info = get_steam_workshop_info(workshop_id);
-  std::string message =
-      std::format("{}  '{}' was not found.\n", game::toString(zoneType), name);
-  if (name != workshop_id)
-    message += std::format("Workshop ID: {}\n", workshop_id);
-  if (!info.title.empty())
-    message += "Title: " + info.title + "\n";
-  if (info.file_size > 0)
-    message += "Size: " + human_readable_size(info.file_size) + "\n";
-  message += "\nDo you want to download it from the Steam Workshop?";
-  download_overlay::show_confirmation(
-      std::format("Download {}?", game::toString(zoneType)), message,
-      [id = std::string(workshop_id), zoneType] {
-        start_download(id, zoneType);
+  // Fetch Workshop metadata off the main thread so joining does not freeze
+  // while Steam responds. Copy the views before the caller returns.
+  std::thread fetch_thread = utils::thread::create_named_thread(
+      "workshop_info", [zoneType, name = std::string(name),
+                        workshop_id = std::string(workshop_id)] {
+        const workshop_info info = get_steam_workshop_info(workshop_id);
+        std::string message = std::format("{}  '{}' was not found.\n",
+                                          game::toString(zoneType), name);
+        if (name != workshop_id)
+          message += std::format("Workshop ID: {}\n", workshop_id);
+        if (!info.title.empty())
+          message += "Title: " + info.title + "\n";
+        if (info.file_size > 0)
+          message += "Size: " + human_readable_size(info.file_size) + "\n";
+        message += "\nDo you want to download it from the Steam Workshop?";
+        download_overlay::show_confirmation(
+            std::format("Download {}?", game::toString(zoneType)), message,
+            [workshop_id, zoneType] { start_download(workshop_id, zoneType); });
       });
+  fetch_thread.detach();
 }
 
 bool start_fastdl(game::ZoneType zoneType, const std::string_view &name,
@@ -1283,6 +1309,11 @@ bool check_valid_usermap_id(const std::string_view &mapname,
       return false;
     }
   } else {
+    // Hosts can advertise either the map's internal name or its Workshop ID.
+    // An existing pool entry means it is already installed under either name.
+    if (!pub_id.empty() || has_usermap(mapname)) {
+      return true;
+    }
 
     if (downloading_workshop_item.load() || launcher_downloading.load() ||
         fastdl::is_downloading()) {
@@ -1399,7 +1430,20 @@ bool mod_switch_requires_fs_reinitialization(
 }
 
 void wait_for_mod_load() {
+  // Runs on the main thread while joining: a load that never leaves LOADING
+  // (broken or half-downloaded mod) used to hang the game forever
+  constexpr std::chrono::seconds timeout = 120s;
+  const auto start = std::chrono::steady_clock::now();
+
   while (game::ugc::active_mod->loadState == game::ugc::ModLoadState::LOADING) {
+    if (std::chrono::steady_clock::now() - start > timeout) {
+      printf("[ Workshop ] Mod '%s' still loading after %llds, continuing "
+             "without waiting\n",
+             game::ugc::active_mod->publisherId,
+             static_cast<long long>(timeout.count()));
+      return;
+    }
+
     std::this_thread::sleep_for(100ms);
   }
 }

@@ -18,6 +18,10 @@ void send_data(const game::net::netadr_t &address, const std::string &data);
 
 typedef std::function<void(game::net::netadr_t address)> resolvedAddrCallback_t;
 game::net::netadr_t address_from_string(const std::string_view &address);
+// Only numeric "a.b.c.d:port": never does a DNS lookup, so it's safe to call
+// on the main thread
+std::optional<game::net::netadr_t>
+parse_ip_address(const std::string_view &address);
 game::net::netadr_t address_from_ip(uint32_t ip, uint16_t port);
 
 void address_from_string_async(const std::string &address,

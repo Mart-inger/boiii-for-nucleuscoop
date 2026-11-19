@@ -19,7 +19,6 @@
 #include <utils/io.hpp>
 #include <utils/named_mutex.hpp>
 #include <utils/properties.hpp>
-#include <utils/smbios.hpp>
 #include <utils/string.hpp>
 
 #include <game/fragment_handler.hpp>
@@ -40,60 +39,9 @@ std::optional<int32_t> try_parse_int(const std::string_view &str) {
   return ec == std::errc{} && ptr == last ? std::optional(value) : std::nullopt;
 }
 
-std::string get_hdd_serial() {
-  DWORD serial{};
-  if (GetVolumeInformationA("C:\\", nullptr, 0, &serial, nullptr, nullptr,
-                            nullptr, 0) == 0) {
-    return {};
-  }
-
-  return utils::string::va("%08X", serial);
-}
-
-std::string get_hw_profile_guid() {
-  HW_PROFILE_INFO info{};
-  if (GetCurrentHwProfileA(&info) == 0) {
-    return {};
-  }
-
-  return info.szHwProfileGuid;
-}
-
-std::string get_machine_guid() {
-  char guid[256]{};
-  DWORD size = sizeof(guid);
-  const LSTATUS result = RegGetValueA(
-      HKEY_LOCAL_MACHINE, "SOFTWARE\\Microsoft\\Cryptography", "MachineGuid",
-      RRF_RT_REG_SZ | RRF_SUBKEY_WOW6464KEY, nullptr, guid, &size);
-  if (result != ERROR_SUCCESS || size <= 1) {
-    return {};
-  }
-
-  return std::string{guid, size - 1};
-}
-
-std::string get_key_entropy(game::ControllerIndex_t controllerIndex) {
-  std::string entropy = utils::smbios::get_uuid();
-
-  entropy.append(utils::smbios::get_uuid());
-  entropy.append(get_machine_guid());
-  entropy.append(get_hw_profile_guid());
-  entropy.append(get_hdd_serial());
-
-  if (entropy.empty()) {
-    entropy.resize(32);
-    utils::cryptography::random::get_data(entropy.data(), entropy.size());
-  } else {
-    entropy.append(game::alias() ? "ezz-boiii-auth-alias-v2"
-                                 : "ezz-boiii-auth-v2");
-  }
-
-  if (controllerIndex != game::ControllerIndex_t::CONTROLLER_INDEX_0) {
-    uint32_t index_raw = static_cast<uint32_t>(controllerIndex);
-    std::string index_str = utils::string::va("%X", index_raw);
-    entropy.append(index_str);
-  }
-
+std::string get_key_entropy() {
+  std::string entropy(64, '\0');
+  utils::cryptography::random::get_data(entropy.data(), entropy.size());
   return entropy;
 }
 
@@ -179,8 +127,7 @@ load_or_generate_key(game::ControllerIndex_t controllerIndex) {
     return key;
   }
 
-  key = utils::cryptography::ecc::generate_key(
-      512, get_key_entropy(controllerIndex));
+  key = utils::cryptography::ecc::generate_key(512, get_key_entropy());
   if (!key.is_valid()) {
     throw std::runtime_error("Failed to generate cryptographic key!");
   }
@@ -208,7 +155,22 @@ get_key_internal(game::ControllerIndex_t controllerIndex) {
 }
 
 utils::cryptography::ecc::key get_key(game::ControllerIndex_t controllerIndex) {
-  return get_key_internal(controllerIndex);
+  // The key never changes during a session. Loading it means taking a mutex
+  // shared by every instance, reading the key and its backup and rewriting
+  // the public key, and every connect needs it twice.
+  static std::mutex cache_mutex;
+  static std::map<uint32_t, utils::cryptography::ecc::key> cache;
+
+  const uint32_t index = static_cast<uint32_t>(controllerIndex);
+
+  std::lock_guard lock(cache_mutex);
+  if (const auto it = cache.find(index); it != cache.end()) {
+    return it->second;
+  }
+
+  utils::cryptography::ecc::key key = get_key_internal(controllerIndex);
+  cache.emplace(index, key);
+  return key;
 }
 
 inline constexpr size_t CHALLENGE_LENGTH = 32;
@@ -668,6 +630,9 @@ void CL_DisconnectPacket_ClearStoredChallenge(
     const char *reason) {
   if (localClientNum == game::LOCAL_CLIENT_0) {
     clear_stored_challenge();
+  }
+  if (from) {
+    party::on_server_disconnect(localClientNum, *from, reason);
   }
   CL_DisconnectPacket_hook.invoke(localClientNum, from, reason);
 }

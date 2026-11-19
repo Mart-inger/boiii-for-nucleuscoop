@@ -8,6 +8,9 @@
 
 #include <utils/string.hpp>
 
+#include <deque>
+#include <mutex>
+
 namespace toast {
 using namespace game::lua::hks;
 namespace {
@@ -68,6 +71,41 @@ bool execute_lua(const std::string &code) {
   return false;
 }
 
+// The game's toast widget raises a Lua error ("toastnotification.lua:39:
+// attempt to index a nil value") when a toast is shown while another one is
+// still on screen: its queueing code dereferences nil. Show them one at a
+// time instead, spaced so the previous one is gone.
+constexpr std::chrono::milliseconds toast_spacing = 5000ms;
+constexpr size_t max_queued_toasts = 4;
+
+std::mutex toast_queue_mutex;
+std::deque<std::string> toast_queue;
+std::chrono::steady_clock::time_point last_toast{};
+
+void enqueue_toast(const std::string &code) {
+  std::scoped_lock lock(toast_queue_mutex);
+  if (toast_queue.size() >= max_queued_toasts) {
+    toast_queue.pop_front(); // the newest ones matter most
+  }
+  toast_queue.push_back(code);
+}
+
+void show_next_toast() {
+  std::string code;
+  {
+    std::scoped_lock lock(toast_queue_mutex);
+    const auto now = std::chrono::steady_clock::now();
+    if (toast_queue.empty() || now - last_toast < toast_spacing) {
+      return;
+    }
+    code = std::move(toast_queue.front());
+    toast_queue.pop_front();
+    last_toast = now;
+  }
+
+  execute_lua(code);
+}
+
 void show_as(const std::string &state, const std::string &title,
              const std::string &description, const std::string &icon) {
   if (game::is_server())
@@ -87,7 +125,7 @@ void show_as(const std::string &state, const std::string &title,
       escaped_state.c_str(), escaped_title.c_str(), escaped_description.c_str(),
       escaped_icon.c_str());
 
-  scheduler::once([code] { execute_lua(code); }, scheduler::main);
+  enqueue_toast(code);
 }
 
 const char *zombie_toast_patch = R"lua(
@@ -175,4 +213,13 @@ void info(const std::string &title, const std::string &description) {
   show(title, description, "uie_t7_icon_menu_invite_sent");
 }
 
+struct component final : client_component {
+  DEFINE_COMPONENT_NAME("toast");
+
+  void post_unpack() override {
+    scheduler::loop(show_next_toast, scheduler::main, 250ms);
+  }
+};
 } // namespace toast
+
+REGISTER_COMPONENT(toast::component)

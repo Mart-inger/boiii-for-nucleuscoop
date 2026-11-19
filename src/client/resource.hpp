@@ -11,3 +11,7 @@
 #define DW_QOSCONFIG 306
 
 #define TLS_DLL 307
+
+#define LUA_CONNECT_MENU 308
+#define LUA_SKIP_TITLE 309
+#define LUA_TOAST_FIX 310

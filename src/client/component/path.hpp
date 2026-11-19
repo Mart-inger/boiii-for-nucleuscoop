@@ -21,7 +21,16 @@ const std::filesystem::path &root();
 const std::filesystem::path &players_directory();
 const std::filesystem::path &boiii_players_directory();
 
+// The game installation. Differs from cwd() when running from a folder of
+// symlinks to it (Nucleus Co-op instances).
+const std::filesystem::path &real_game_directory();
+
+// Next to the current folder. Used to redirect workshop paths when it's
+// missing, so it deliberately doesn't follow symlinks.
 const std::filesystem::path &steam_workshop_content_directory();
+// The workshop folder of the real installation, also from a folder of
+// symlinks. For listing workshop items, which are loaded by absolute path.
+const std::filesystem::path &installed_workshop_content_directory();
 bool have_steam_workshop_content_directory();
 const std::filesystem::path &usermaps_directory();
 const std::filesystem::path &mods_directory();

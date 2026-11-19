@@ -14,6 +14,7 @@
 #include <utils/hook.hpp>
 #include <utils/string.hpp>
 
+#include <charconv>
 #include <cstdint>
 #include <functional>
 #include <string>
@@ -283,11 +284,42 @@ void send_data(const game::net::netadr_t &address, const std::string &data) {
   send_data(address, data.data(), data.size());
 }
 
+std::optional<game::net::netadr_t>
+parse_ip_address(const std::string_view &address) {
+  const size_t colon = address.rfind(':');
+  if (colon == std::string_view::npos) {
+    return std::nullopt;
+  }
+
+  const std::string host{address.substr(0, colon)};
+  const std::string_view port_str = address.substr(colon + 1);
+
+  in_addr ip{};
+  uint16_t port{};
+  const auto [ptr, ec] =
+      std::from_chars(port_str.data(), port_str.data() + port_str.size(), port);
+  if (ec != std::errc{} || ptr != port_str.data() + port_str.size() ||
+      port == 0 || inet_pton(AF_INET, host.data(), &ip) != 1) {
+    return std::nullopt;
+  }
+
+  return address_from_ip(ip.S_un.S_addr, port);
+}
+
 game::net::netadr_t address_from_string(const std::string_view &address) {
+  // Parse "a.b.c.d:port" ourselves so it always becomes a real UDP address.
+  // The engine resolves loopback addresses like 127.0.0.1 to NA_LOOPBACK,
+  // which never reaches another instance's socket on the same machine.
+  if (const std::optional<game::net::netadr_t> ip = parse_ip_address(address)) {
+    return *ip;
+  }
+
   game::net::netadr_t addr{};
   addr.localNetID = game::net::netsrc_t::SERVER;
 
-  if (!game::net::NET_StringToAdr(address.data(), &addr)) {
+  // A string_view isn't guaranteed to be null-terminated
+  const std::string address_str{address};
+  if (!game::net::NET_StringToAdr(address_str.data(), &addr)) {
     addr.type = game::net::netadrtype_t::BAD;
     return addr;
   }
@@ -301,6 +333,12 @@ game::net::netadr_t address_from_string(const std::string_view &address) {
 
 void address_from_string_async(const std::string &address,
                                resolvedAddrCallback_t &cb) {
+  // An IP needs no lookup; only hostnames need a thread
+  if (const std::optional<game::net::netadr_t> ip = parse_ip_address(address)) {
+    cb(*ip);
+    return;
+  }
+
   std::thread([address, cb]() {
     const game::net::netadr_t resolved = address_from_string(address);
     cb(resolved);

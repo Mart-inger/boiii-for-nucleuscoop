@@ -3,6 +3,9 @@
 #include "component/error_help.hpp"
 #include "component/exception.hpp"
 #include "component/game_event.hpp"
+#include "component/host_packet_spam.hpp"
+#include "component/network.hpp"
+#include "component/party.hpp"
 #include "component/path.hpp"
 
 #include <loader/component_loader.hpp>
@@ -210,6 +213,10 @@ void add_server_command_stub(game::sv::client_s *client,
                              const game::net::svscmd_type type,
                              const char *command) {
   if (client && command && is_repeated_configstring(client, command)) {
+    return;
+  }
+  // Redundant HUD updates of custom maps/big mods (see host_packet_spam.cpp)
+  if (host_packet_spam::is_redundant_luinotify(client, command)) {
     return;
   }
   add_server_command_hook.invoke<void>(client, type, command);

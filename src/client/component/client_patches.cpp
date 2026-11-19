@@ -5,6 +5,7 @@
 #include <loader/component_loader.hpp>
 
 #include "command.hpp"
+#include "party.hpp"
 #include "scheduler.hpp"
 
 #include <game/impl/cg/cg.hpp>
@@ -418,6 +419,13 @@ void fix_mapswitch_crashes() {
 utils::hook::detour SV_FastRestart_f_hook;
 utils::hook::detour SV_MapRestart_f_hook;
 
+// By default fast_restart is the game's own fast restart: no map reload, so
+// players stay connected and nobody reloads. Reloading the map (upstream's
+// choice, set this to 1) made joined clients re-register their clientfields
+// on a custom map + big mods and get dropped with "Clientfield Mismatch",
+// or cycled out while still loading.
+game::EngineDependentDvarMut fast_restart_full_reload;
+
 inline constexpr std::string_view TDM_GAMETYPE = "tdm";
 inline constexpr std::string_view ZCLASSIC_GAMETYPE = "zclassic";
 inline constexpr std::string_view CAMPAIGN_GAMETYPE = "cp";
@@ -426,6 +434,25 @@ inline constexpr std::string_view ZOMBIES_MAP_PREFIX = "zm_";
 inline constexpr std::string_view CAMPAIGN_MAP_PREFIX = "cp_";
 template <const game::RestartMethod_t RestartMethod>
 void SV_RestartCmd_RotateOrDefault() {
+  // Clients have no server to restart (the Nucleus hotkeys send the command
+  // to every instance). The original commands bail out here too; calling
+  // SV_MapRestart anyway restarted a server that isn't running.
+  if (!game::get_sv_running()) {
+    printf("Server is not running.\n");
+    return;
+  }
+
+  // Restart with the max clients the match started with, the value the
+  // connected clients registered their clientfields with
+  party::restore_host_match_max_clients();
+
+  if constexpr (RestartMethod == game::RestartMethod_t::ROUND) {
+    if (!fast_restart_full_reload || !fast_restart_full_reload.get_bool()) {
+      SV_FastRestart_f_hook.invoke<void>();
+      return;
+    }
+  }
+
   if (game::get_sv_running() &&
       !game::com::Com_SessionMode_IsMode(game::eModes::COUNT) /* main menu */) {
     std::string_view curr_gametype = TDM_GAMETYPE;
@@ -668,6 +695,11 @@ public:
     */
     utils::hook::jump(game::cl::CL_CheckForResend.get(),
                       game::cl::CL_CheckForResend_Impl);
+    fast_restart_full_reload = game::register_dvar_bool(
+        "fast_restart_full_reload", false, game::dvarFlags_e::ARCHIVE,
+        "fast_restart reloads the whole map (1) or uses the game's own fast "
+        "restart without reloading (0)");
+
     SV_MapRestart_f_hook.create(
         game::sv::SV_MapRestart_f.get(),
         SV_RestartCmd_RotateOrDefault<game::RestartMethod_t::FULL>);

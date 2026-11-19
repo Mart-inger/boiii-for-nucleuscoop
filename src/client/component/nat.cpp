@@ -18,6 +18,7 @@
 #include "upnp.hpp"
 #include "workshop/workshop.hpp"
 
+#include <utils/flags.hpp>
 #include <utils/hook.hpp>
 #include <utils/string.hpp>
 
@@ -1069,6 +1070,34 @@ bool set_open_to_friends(const bool enabled) {
   return true;
 }
 
+namespace {
+// Open the party once per session as soon as this instance hosts its lobby,
+// so other players (and Nucleus Co-op instances) can join the lobby without
+// opening it by hand. Closing it afterwards is respected. -partyclosed keeps
+// the old behaviour (closed until opened).
+bool auto_open_done = false;
+
+void auto_open_party() {
+  if (auto_open_done || game::is_server()) {
+    return;
+  }
+
+  if (open_to_friends) {
+    auto_open_done = true;
+    return;
+  }
+
+  if (!can_host()) {
+    return; // no lobby yet, or we're a member of someone else's
+  }
+
+  if (set_open_to_friends(true)) {
+    auto_open_done = true;
+    printf("Party opened to friends by default (-partyclosed to disable)\n");
+  }
+}
+} // namespace
+
 void refresh_friends(const std::vector<game::XUID> &steam_ids,
                      lookup_callback callback) {
   std::unordered_set<game::XUID> pending;
@@ -1115,6 +1144,10 @@ public:
 
     if (game::is_server()) {
       return;
+    }
+
+    if (!utils::flags::has_flag("partyclosed")) {
+      scheduler::loop(auto_open_party, scheduler::main, 2s);
     }
 
     scheduler::once(

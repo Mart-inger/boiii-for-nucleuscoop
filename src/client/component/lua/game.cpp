@@ -9,6 +9,7 @@
 #include <component/friends.hpp>
 #include <component/getinfo.hpp>
 #include <component/gpu.hpp>
+#include <component/local_instances.hpp>
 #include <component/lua/lua_state.hpp>
 #include <component/name.hpp>
 #include <component/scheduler.hpp>
@@ -146,6 +147,56 @@ luaReturnCount_e getrecentcount(lua_State *luaVM) {
 
 luaReturnCount_e refreshfriends(lua_State *luaVM) {
   return call(luaVM, [] { friends::refresh_presence(); });
+}
+
+// Other BOIII instances on this machine and the LAN, for the built-in connect
+// menu (resources/lua/connect_menu.lua)
+table local_instance_to_table(const local_instances::instance &inst) {
+  table t = table();
+  t.set("name", inst.name);
+  t.set("address", inst.address);
+  t.set("hosting", inst.hosting);
+  t.set("lan", inst.lan);
+  t.set("mode", inst.mode);
+  t.set("clients", inst.clients);
+  t.set("maxclients", inst.max_clients);
+  return t;
+}
+
+luaReturnCount_e getlocalinstancecount(lua_State *luaVM) {
+  return call(luaVM, []() -> int32_t {
+    return static_cast<int32_t>(local_instances::get_instances().size());
+  });
+}
+
+luaReturnCount_e getlocalinstance(lua_State *luaVM) {
+  return call(luaVM, [](const int index) -> table {
+    const std::vector<local_instances::instance> instances =
+        local_instances::get_instances();
+    // 1-based like Lua arrays
+    if (index >= 1 && static_cast<size_t>(index) <= instances.size()) {
+      return local_instance_to_table(instances[index - 1]);
+    }
+    return table();
+  });
+}
+
+// The whole list in one call: getlocalinstance(i) copies and sorts the list
+// for every index
+luaReturnCount_e getlocalinstances(lua_State *luaVM) {
+  return call(luaVM, []() -> table {
+    table result = table();
+    int32_t index = 1;
+    for (const local_instances::instance &inst :
+         local_instances::get_instances()) {
+      result.set(index++, local_instance_to_table(inst));
+    }
+    return result;
+  });
+}
+
+luaReturnCount_e refreshlocalinstances(lua_State *luaVM) {
+  return call(luaVM, [] { local_instances::refresh(); });
 }
 
 luaReturnCount_e addfriend(lua_State *luaVM) {
@@ -675,6 +726,14 @@ public:
         lua_state::luaL_LoggedReg<"game", "getrecentplayer", getrecentplayer>(),
         lua_state::luaL_LoggedReg<"game", "getrecentcount", getrecentcount>(),
         lua_state::luaL_LoggedReg<"game", "refreshfriends", refreshfriends>(),
+        lua_state::luaL_LoggedReg<"game", "getlocalinstancecount",
+                                  getlocalinstancecount>(),
+        lua_state::luaL_LoggedReg<"game", "getlocalinstance",
+                                  getlocalinstance>(),
+        lua_state::luaL_LoggedReg<"game", "getlocalinstances",
+                                  getlocalinstances>(),
+        lua_state::luaL_LoggedReg<"game", "refreshlocalinstances",
+                                  refreshlocalinstances>(),
         lua_state::luaL_LoggedReg<"game", "addfriend", addfriend>(),
         lua_state::luaL_LoggedReg<"game", "removefriend", removefriend>(),
         lua_state::luaL_LoggedReg<"game", "invitefriend", invitefriend>(),
