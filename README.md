@@ -14,3 +14,5 @@ Source code of Ezz BOIII adapted for Nucleus Co-op.
 - Mod loading compatibility fixes and timeout handling.
 - Filtering of redundant reliable HUD commands in player-hosted matches.
 - Title-screen skipping, menu/toast fixes, and per-instance console logs.
+
+Unofficial fork of [Ezz BOIII](https://github.com/Ezz-lol/boiii-free). Nucleus Co-op changes made November 19, 2026. Licensed under [GPLv3](LICENSE).
